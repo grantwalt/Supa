@@ -1,4 +1,4 @@
-name: Deploy Supabase Function
+name: Deploy Supabase Functions
 
 on:
   push:
@@ -19,12 +19,12 @@ jobs:
       - name: Debug Supabase CLI
         run: supabase --version
 
-      - name: Link Supabase project (DEBUG)
-        run: supabase link --project-ref ${{ secrets.SUPABASE_PROJECT_ID }} --debug
+      - name: Link Supabase project
+        run: supabase link --project-ref ${{ secrets.SUPABASE_PROJECT_ID }}
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
 
-      - name: Deploy Edge Function (DEBUG)
-        run: supabase functions deploy retrieve --debug
+      - name: Deploy Edge Function
+        run: supabase functions deploy retrieve --project-ref ${{ secrets.SUPABASE_PROJECT_ID }}
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
