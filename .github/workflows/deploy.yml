@@ -16,7 +16,12 @@ jobs:
       - name: Install Supabase CLI
         run: npm install -g supabase
 
+      - name: Link Supabase project
+        run: supabase link --project-ref ${{ secrets.SUPABASE_PROJECT_ID }}
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
       - name: Deploy Edge Function
-        run: supabase functions deploy retrieve --project-ref ${{ secrets.SUPABASE_PROJECT_ID }}
+        run: supabase functions deploy retrieve
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
