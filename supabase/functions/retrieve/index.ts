@@ -611,7 +611,7 @@ Rules:
 
   const projectId = Deno.env.get("GOOGLE_CLOUD_PROJECT") ?? "savvy-scion-476418-q7";
   const location  = "us-central1";
-  const model     = "gemini-2.5-flash-lite-preview";
+  const model     = "gemini-2.5-flash-lite";
   const url       = `https://${location}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${location}/publishers/google/models/${model}:generateContent`;
 
   const accessToken = await getVertexAccessToken();
