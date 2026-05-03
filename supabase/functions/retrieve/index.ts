@@ -977,6 +977,8 @@ function trackAnalytics(
   supabase.from("analytics_log").insert(payload)
     .catch(err => console.warn("[retrieve] analytics write failed:", err));
 }
+
+async function incrementHitCount(
   supabase: ReturnType<typeof createClient>,
   id:       string,
 ): Promise<void> {
