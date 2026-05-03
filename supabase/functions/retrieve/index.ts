@@ -18,9 +18,11 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 // ── CONSTANTS ───────────────────────────────────────────────
 
-const SIMILARITY_THRESHOLD = 0.82;   // minimum cosine score for vector match
+const SIMILARITY_THRESHOLD = 0.75;   // minimum cosine score for vector match (was 0.82 — lowered to catch more good matches)
 const CONFIDENCE_THRESHOLD = 0.75;   // minimum model_confidence to serve unreviewed entry
 const MAX_REQUESTS_PER_SESSION = 60; // rate limit per session
+const MAX_LLM_CALLS_PER_SESSION = 10; // hard LLM cap per hour — protects $300 credit
+const MIN_QUESTION_LENGTH = 8;       // skip embedding for trivially short inputs
 const RATE_WINDOW_SECONDS = 3600;    // 1 hour window
 
 const CORS = {
@@ -134,6 +136,7 @@ serve(async (req: Request) => {
       latency.stage1_ms = Math.round(performance.now() - t1);
       console.log(`[retrieve] cache_exact | intent=${intent_id} | ${latency.stage1_ms}ms`);
       incrementHitCount(supabase, exactMatch.id);
+      trackAnalytics(supabase, { session_id, case_id, stage: "exact", source: "cache_exact", latency_ms: latency.stage1_ms, intent_id });
 
       return respond({
         reply:         exactMatch.response_text,
@@ -174,18 +177,21 @@ serve(async (req: Request) => {
 
   // ════════════════════════════════════════════════════════
   //  STAGE 3 — VECTOR SIMILARITY SEARCH (AI mode only)
-  //  Embeds the question, searches response_cache embeddings.
+  //  Skip if question too short — not worth embedding cost.
   //  Only serves matches above SIMILARITY_THRESHOLD.
-  //  Also checks high-confidence unreviewed entries.
   // ════════════════════════════════════════════════════════
 
   const t2 = performance.now();
   let questionEmbedding: number[] | null = null;
 
-  try {
-    questionEmbedding = await embedText(question, supabase);
-  } catch (e) {
-    console.warn("[retrieve] Embedding failed, skipping vector search:", e);
+  if (question.length >= MIN_QUESTION_LENGTH) {
+    try {
+      questionEmbedding = await embedText(question, supabase);
+    } catch (e) {
+      console.warn("[retrieve] Embedding failed, skipping vector search:", e);
+    }
+  } else {
+    console.log(`[retrieve] question too short (${question.length} chars) — skipping embedding`);
   }
 
   if (questionEmbedding && questionEmbedding.length > 0) {
@@ -197,6 +203,7 @@ serve(async (req: Request) => {
       latency.stage3_ms = Math.round(performance.now() - t2);
       console.log(`[retrieve] cache_vector | intent=${vectorMatch.intent_id} | ${latency.stage3_ms}ms`);
       incrementHitCount(supabase, vectorMatch.id);
+      trackAnalytics(supabase, { session_id, case_id, stage: "vector", source: "cache_vector", latency_ms: latency.stage3_ms, intent_id: vectorMatch.intent_id });
 
       return respond({
         reply:         vectorMatch.response_text,
@@ -213,9 +220,26 @@ serve(async (req: Request) => {
 
   // ════════════════════════════════════════════════════════
   //  STAGE 4 — LLM LIVE CALL (AI mode only)
-  //  Last resort. Calls Gemini, validates the response,
+  //  Hard cap: MAX_LLM_CALLS_PER_SESSION per hour.
+  //  Last resort. Calls Vertex AI, validates the response,
   //  saves to unmatched_log or response_cache.
   // ════════════════════════════════════════════════════════
+
+  // ── LLM cap guard — prevents runaway cost
+  const llmCapResult = await checkLLMCap(supabase, session_id);
+  if (!llmCapResult.allowed) {
+    const fallback = getClassicFallback(caseData, intent_id, resolvedPersonality);
+    console.warn(`[retrieve] LLM cap reached for session ${session_id} — forcing fallback`);
+    return respond({
+      reply:         fallback.text,
+      intent_id:     intent_id ?? null,
+      response_type: fallback.type,
+      personality:   resolvedPersonality,
+      source:        "fallback",
+      reviewed:      true,
+      cache_id:      null,
+    });
+  }
 
   const t4 = performance.now();
   let llmResult: LLMResult | null = null;
@@ -228,7 +252,7 @@ serve(async (req: Request) => {
 
   if (!llmResult) {
     // LLM unreachable — use classic fallback for consistent UX
-    const fallback = getClassicFallback(caseData, intent_id);
+    const fallback = getClassicFallback(caseData, intent_id, resolvedPersonality);
     console.warn("[retrieve] LLM call failed, using classic fallback");
     return respond({
       reply:         fallback.text,
@@ -255,7 +279,7 @@ serve(async (req: Request) => {
     });
 
     return respond({
-      reply:         getClassicFallback(caseData, intent_id).text,
+      reply:         getClassicFallback(caseData, intent_id, resolvedPersonality).text,
       intent_id:     intent_id ?? null,
       response_type: "history",
       personality:   resolvedPersonality,
@@ -330,6 +354,7 @@ serve(async (req: Request) => {
 
   latency.stage4_ms = Math.round(performance.now() - t4);
   console.log(`[retrieve] llm_live | intent=${resolvedIntentId ?? "unknown"} | ${latency.stage4_ms}ms`);
+  trackAnalytics(supabase, { session_id, case_id, stage: "llm", source: "llm_live", latency_ms: latency.stage4_ms, intent_id: resolvedIntentId ?? null });
 
   return respond({
     reply:         llmResult.answer,
@@ -439,8 +464,9 @@ async function fetchByVector(
 // ── STAGE 3 HELPER — classic fallback ───────────────────────
 
 function getClassicFallback(
-  caseData:  Record<string, unknown>,
-  intent_id: string | null | undefined,
+  caseData:    Record<string, unknown>,
+  intent_id:   string | null | undefined,
+  personality: string = "neutral",
 ): { text: string; type: string; score: number } {
 
   if (intent_id) {
@@ -451,8 +477,17 @@ function getClassicFallback(
     }
   }
 
+  // Personality-aware fallback — improves realism without LLM cost
+  const fallbackByPersonality: Record<string, string> = {
+    anxious:     "I'm not really sure… I'm a bit worried, can you ask me something else?",
+    stoic:       "I don't think that's relevant.",
+    reticent:    "...I'm not sure.",
+    cooperative: "Hmm, I don't know how to answer that. Maybe try another question?",
+    neutral:     "I'm not sure that's relevant to my condition. Could you ask me something else?",
+  };
+
   return {
-    text:  "I'm not sure that's relevant to my condition. Could you ask me something else?",
+    text:  fallbackByPersonality[personality] ?? fallbackByPersonality.neutral,
     type:  "history",
     score: 0,
   };
@@ -460,9 +495,9 @@ function getClassicFallback(
 
 
 // ── LLM CALL ────────────────────────────────────────────────
-//  Uses Gemini 1.5 Flash — fast, cheap, good at structured JSON.
-//  Model string: gemini-1.5-flash-latest
-//  API secret:   GEMINI_API_KEY  (set in Supabase Edge Function secrets)
+//  Uses Vertex AI Gemini 2.5 Flash Lite Preview
+//  Auth: service account JWT → short-lived access token (cached 55 min)
+//  Secret: GOOGLE_SERVICE_ACCOUNT_KEY (base64-encoded JSON)
 
 interface LLMResult {
   cleaned_question:  string;
@@ -474,6 +509,68 @@ interface LLMResult {
   confidence:        number;
   personality_notes: string;
   flags:             string[];
+}
+
+// Module-level token cache — reused across requests in same isolate lifetime
+let _tokenCache: { token: string; expiry: number } | null = null;
+
+async function getVertexAccessToken(): Promise<string> {
+  const now = Date.now();
+
+  // Return cached token if still valid (55 min window, tokens expire at 60)
+  if (_tokenCache && now < _tokenCache.expiry) {
+    return _tokenCache.token;
+  }
+
+  const b64   = Deno.env.get("GOOGLE_SERVICE_ACCOUNT_KEY")!;
+  const creds = JSON.parse(atob(b64));
+
+  const now   = Math.floor(Date.now() / 1000);
+  const header = btoa(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+  const claim  = btoa(JSON.stringify({
+    iss:   creds.client_email,
+    scope: "https://www.googleapis.com/auth/cloud-platform",
+    aud:   "https://oauth2.googleapis.com/token",
+    iat:   now,
+    exp:   now + 3600,
+  }));
+
+  const pemBody   = creds.private_key
+    .replace("-----BEGIN PRIVATE KEY-----", "")
+    .replace("-----END PRIVATE KEY-----", "")
+    .replace(/\n/g, "");
+  const binaryDer = Uint8Array.from(atob(pemBody), c => c.charCodeAt(0));
+
+  const privateKey = await crypto.subtle.importKey(
+    "pkcs8", binaryDer.buffer,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false, ["sign"],
+  );
+
+  const signingInput = `${header}.${claim}`;
+  const signature    = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    privateKey,
+    new TextEncoder().encode(signingInput),
+  );
+
+  const jwt = `${signingInput}.${btoa(String.fromCharCode(...new Uint8Array(signature)))}`;
+
+  const tokenResp = await fetch("https://oauth2.googleapis.com/token", {
+    method:  "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body:    `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
+  });
+
+  const tokenData = await tokenResp.json();
+
+  // Cache for 55 minutes
+  _tokenCache = {
+    token:  tokenData.access_token as string,
+    expiry: now + (55 * 60 * 1000),
+  };
+
+  return _tokenCache.token;
 }
 
 async function callLLM(
@@ -512,13 +609,19 @@ Rules:
 - Answer must be consistent with the patient profile (age, gender, presenting complaint).
 `.trim();
 
-  const apiKey = Deno.env.get("GEMINI_API_KEY")!;
-  const model  = "gemini-1.5-flash-latest";
-  const url    = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  const projectId = Deno.env.get("GOOGLE_CLOUD_PROJECT") ?? "savvy-scion-476418-q7";
+  const location  = "us-central1";
+  const model     = "gemini-2.5-flash-lite-preview";
+  const url       = `https://${location}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${location}/publishers/google/models/${model}:generateContent`;
+
+  const accessToken = await getVertexAccessToken();
 
   const resp = await fetchWithRetry(url, {
     method:  "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type":  "application/json",
+      "Authorization": `Bearer ${accessToken}`,
+    },
     body: JSON.stringify({
       system_instruction: {
         parts: [{ text: systemInstruction }],
@@ -527,21 +630,20 @@ Rules:
         { role: "user", parts: [{ text: question }] },
       ],
       generationConfig: {
-        temperature:     0.4,   // low temp for consistent, factual patient replies
-        maxOutputTokens: 512,
-        responseMimeType: "application/json",  // Gemini native JSON mode
+        temperature:      0.4,   // low temp for consistent, factual patient replies
+        maxOutputTokens:  512,
       },
     }),
   });
 
   if (!resp.ok) {
     const errText = await resp.text();
-    throw new Error(`Gemini API error ${resp.status}: ${errText}`);
+    throw new Error(`Vertex AI API error ${resp.status}: ${errText}`);
   }
 
-  const data = await resp.json();
+  const data  = await resp.json();
 
-  // Gemini response shape:
+  // Vertex AI response shape mirrors Gemini:
   // data.candidates[0].content.parts[0].text
   const raw   = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
   const clean = raw.replace(/```json|```/g, "").trim();
@@ -550,7 +652,18 @@ Rules:
     return JSON.parse(clean) as LLMResult;
   } catch (e) {
     console.error("[retrieve] JSON parse failed. Raw output:", clean);
-    throw new Error("Invalid JSON from LLM");
+    // Return safe fallback instead of crashing Stage 4
+    return {
+      cleaned_question:  question,
+      answer:            "I'm not sure I understand. Could you rephrase that?",
+      intent:            null,
+      keywords:          [],
+      category:          "history",
+      urgency:           "low",
+      confidence:        0,
+      personality_notes: "",
+      flags:             ["parse_error"],
+    };
   }
 }
 
@@ -701,7 +814,8 @@ async function checkRateLimit(
 
 
 // ── EMBEDDING ───────────────────────────────────────────────
-//  Uses Gemini text-embedding-004 — 768-dim.
+//  Uses Vertex AI text-embedding-004 — 768-dim.
+//  Unified under Vertex — same auth as LLM, single billing system.
 //  Checks embedding_cache first — avoids re-embedding the
 //  same question string. Cache key is the exact text.
 
@@ -722,28 +836,31 @@ async function embedText(
     return cached.embedding as unknown as number[];
   }
 
-  // ── Call Gemini
-  const apiKey = Deno.env.get("GEMINI_API_KEY")!;
-  const model  = "text-embedding-004";
-  const url    = `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent?key=${apiKey}`;
+  // ── Call Vertex AI embedding endpoint
+  const projectId   = Deno.env.get("GOOGLE_CLOUD_PROJECT") ?? "savvy-scion-476418-q7";
+  const location    = "us-central1";
+  const model       = "text-embedding-004";
+  const url         = `https://${location}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${location}/publishers/google/models/${model}:predict`;
+  const accessToken = await getVertexAccessToken();
 
   const resp = await fetchWithRetry(url, {
     method:  "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Authorization": `Bearer ${accessToken}`,
+      "Content-Type":  "application/json",
+    },
     body: JSON.stringify({
-      model:    `models/${model}`,
-      content:  { parts: [{ text }] },
-      taskType: "RETRIEVAL_QUERY",
+      instances: [{ content: text, task_type: "RETRIEVAL_QUERY" }],
     }),
   });
 
   if (!resp.ok) {
     const errText = await resp.text();
-    throw new Error(`Gemini embedding error ${resp.status}: ${errText}`);
+    throw new Error(`Vertex embedding error ${resp.status}: ${errText}`);
   }
 
   const data      = await resp.json();
-  const embedding = data.embedding?.values ?? [];
+  const embedding = data.predictions?.[0]?.embeddings?.values ?? [];
 
   // ── Write to cache (non-blocking)
   if (embedding.length > 0) {
@@ -809,7 +926,57 @@ function getIntentScore(
   return 5;
 }
 
-async function incrementHitCount(
+async function checkLLMCap(
+  supabase:   ReturnType<typeof createClient>,
+  session_id: string,
+): Promise<{ allowed: boolean }> {
+
+  const now      = Date.now();
+  const windowMs = RATE_WINDOW_SECONDS * 1000;
+
+  const { data: session } = await supabase
+    .from("sessions")
+    .select("llm_call_count, last_llm_at")
+    .eq("session_id", session_id)
+    .maybeSingle();
+
+  const lastLLM  = session ? new Date(session.last_llm_at ?? 0).getTime() : 0;
+  const resetCount = !session || (now - lastLLM > windowMs);
+  const newCount   = resetCount ? 1 : (session!.llm_call_count ?? 0) + 1;
+
+  if (newCount > MAX_LLM_CALLS_PER_SESSION) {
+    return { allowed: false };
+  }
+
+  // Non-blocking update
+  supabase.from("sessions").upsert({
+    session_id,
+    llm_call_count: newCount,
+    last_llm_at:    new Date().toISOString(),
+  }, { onConflict: "session_id" }).catch(() => {});
+
+  return { allowed: true };
+}
+
+
+// ── ANALYTICS ───────────────────────────────────────────────
+//  Non-blocking — fire and forget. Logs stage, source, latency.
+//  Use these counts to monitor cache hit rate and LLM spend.
+
+function trackAnalytics(
+  supabase:   ReturnType<typeof createClient>,
+  payload: {
+    session_id:    string;
+    case_id:       string;
+    stage:         "exact" | "vector" | "llm" | "fallback" | "classic";
+    source:        string;
+    latency_ms:    number;
+    intent_id:     string | null;
+  },
+): void {
+  supabase.from("analytics_log").insert(payload)
+    .catch(err => console.warn("[retrieve] analytics write failed:", err));
+}
   supabase: ReturnType<typeof createClient>,
   id:       string,
 ): Promise<void> {
