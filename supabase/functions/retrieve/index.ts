@@ -525,14 +525,14 @@ async function getVertexAccessToken(): Promise<string> {
   const b64   = Deno.env.get("GOOGLE_SERVICE_ACCOUNT_KEY")!;
   const creds = JSON.parse(atob(b64));
 
-  const now   = Math.floor(Date.now() / 1000);
-  const header = btoa(JSON.stringify({ alg: "RS256", typ: "JWT" }));
-  const claim  = btoa(JSON.stringify({
+  const nowSecs = Math.floor(now / 1000);
+  const header  = btoa(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+  const claim   = btoa(JSON.stringify({
     iss:   creds.client_email,
     scope: "https://www.googleapis.com/auth/cloud-platform",
     aud:   "https://oauth2.googleapis.com/token",
-    iat:   now,
-    exp:   now + 3600,
+    iat:   nowSecs,
+    exp:   nowSecs + 3600,
   }));
 
   const pemBody   = creds.private_key
